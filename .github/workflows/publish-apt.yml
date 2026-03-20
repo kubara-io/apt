@@ -68,17 +68,34 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts
-          gh release download "${{ steps.resolve-tag.outputs.release_tag }}" \
-            --repo kubara-io/kubara \
-            --pattern "*.deb" \
-            --dir artifacts
-
           shopt -s nullglob
-          debs=(artifacts/*.deb)
-          if [ "${#debs[@]}" -eq 0 ]; then
-            echo "No .deb artifacts found for tag ${{ steps.resolve-tag.outputs.release_tag }}" >&2
-            exit 1
-          fi
+
+          MAX_ATTEMPTS=8
+          SLEEP_SECONDS=15
+          TAG="${{ steps.resolve-tag.outputs.release_tag }}"
+
+          for attempt in $(seq 1 "${MAX_ATTEMPTS}"); do
+            rm -f artifacts/*.deb
+
+            if gh release download "${TAG}" \
+              --repo kubara-io/kubara \
+              --pattern "*.deb" \
+              --dir artifacts; then
+              debs=(artifacts/*.deb)
+              if [ "${#debs[@]}" -gt 0 ]; then
+                echo "Downloaded ${#debs[@]} .deb artifacts for ${TAG} (attempt ${attempt}/${MAX_ATTEMPTS})"
+                break
+              fi
+            fi
+
+            if [ "${attempt}" -eq "${MAX_ATTEMPTS}" ]; then
+              echo "No .deb artifacts found for tag ${TAG} after ${MAX_ATTEMPTS} attempts" >&2
+              exit 1
+            fi
+
+            echo "Artifacts not available yet for ${TAG} (attempt ${attempt}/${MAX_ATTEMPTS}), retrying in ${SLEEP_SECONDS}s..."
+            sleep "${SLEEP_SECONDS}"
+          done
 
       - name: Build apt repository structure
         shell: bash
