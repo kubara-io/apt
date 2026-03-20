@@ -1,0 +1,179 @@
+name: publish apt repository
+
+on:
+  repository_dispatch:
+    types:
+      - publish-apt
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag from kubara-io/kubara (e.g. v0.7.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apt-pages-publish
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.resolve-tag.outputs.release_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Resolve release tag
+        id: resolve-tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            TAG="${{ github.event.client_payload.release_tag }}"
+          else
+            TAG="${{ inputs.release_tag }}"
+          fi
+
+          if [ -z "${TAG}" ]; then
+            echo "release_tag is required" >&2
+            exit 1
+          fi
+
+          case "${TAG}" in
+            v*) ;;
+            *)
+              echo "release_tag must start with 'v' (got: ${TAG})" >&2
+              exit 1
+              ;;
+          esac
+
+          echo "release_tag=${TAG}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y apt-utils dpkg-dev gnupg
+
+      - name: Download .deb artifacts from kubara release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          gh release download "${{ steps.resolve-tag.outputs.release_tag }}" \
+            --repo kubara-io/kubara \
+            --pattern "*.deb" \
+            --dir artifacts
+
+          shopt -s nullglob
+          debs=(artifacts/*.deb)
+          if [ "${#debs[@]}" -eq 0 ]; then
+            echo "No .deb artifacts found for tag ${{ steps.resolve-tag.outputs.release_tag }}" >&2
+            exit 1
+          fi
+
+      - name: Build apt repository structure
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p repo/pool/main
+          mkdir -p repo/dists/stable/main/binary-amd64
+          mkdir -p repo/dists/stable/main/binary-arm64
+
+          cp artifacts/*.deb repo/pool/main/
+
+          cd repo
+
+          dpkg-scanpackages -a amd64 pool/main /dev/null > dists/stable/main/binary-amd64/Packages
+          gzip -9c < dists/stable/main/binary-amd64/Packages > dists/stable/main/binary-amd64/Packages.gz
+
+          dpkg-scanpackages -a arm64 pool/main /dev/null > dists/stable/main/binary-arm64/Packages
+          gzip -9c < dists/stable/main/binary-arm64/Packages > dists/stable/main/binary-arm64/Packages.gz
+
+          cd dists/stable
+          cat <<EOF > apt-release.conf
+          APT::FTPArchive::Release::Origin "kubara-io";
+          APT::FTPArchive::Release::Label "Kubara";
+          APT::FTPArchive::Release::Suite "stable";
+          APT::FTPArchive::Release::Codename "stable";
+          APT::FTPArchive::Release::Architectures "amd64 arm64";
+          APT::FTPArchive::Release::Components "main";
+          EOF
+          apt-ftparchive -c apt-release.conf release . > Release
+
+      - name: Import signing key
+        id: import-key
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${APT_GPG_PRIVATE_KEY}" ]; then
+            echo "Secret APT_GPG_PRIVATE_KEY is missing" >&2
+            exit 1
+          fi
+
+          printf '%s' "${APT_GPG_PRIVATE_KEY}" | gpg --batch --import
+          FINGERPRINT="$(gpg --batch --list-secret-keys --with-colons | awk -F: '/^fpr:/ {print $10; exit}')"
+
+          if [ -z "${FINGERPRINT}" ]; then
+            echo "No GPG private key fingerprint found after import" >&2
+            exit 1
+          fi
+
+          echo "fingerprint=${FINGERPRINT}" >> "${GITHUB_OUTPUT}"
+
+      - name: Sign repository metadata
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd repo/dists/stable
+          FPR="${{ steps.import-key.outputs.fingerprint }}"
+
+          if [ -n "${GPG_PASSPHRASE}" ]; then
+            gpg --batch --yes --pinentry-mode loopback --passphrase "${GPG_PASSPHRASE}" \
+              --local-user "${FPR}" --clearsign -o InRelease Release
+            gpg --batch --yes --pinentry-mode loopback --passphrase "${GPG_PASSPHRASE}" \
+              --local-user "${FPR}" -abs -o Release.gpg Release
+          else
+            gpg --batch --yes --local-user "${FPR}" --clearsign -o InRelease Release
+            gpg --batch --yes --local-user "${FPR}" -abs -o Release.gpg Release
+          fi
+
+      - name: Export public key
+        shell: bash
+        run: |
+          set -euo pipefail
+          gpg --armor --export "${{ steps.import-key.outputs.fingerprint }}" > repo/apt-public.key
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: repo
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
